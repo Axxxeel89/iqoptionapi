@@ -251,49 +251,75 @@ class IQ_Option:
     # ------- chek if binary/digit/cfd/stock... if open or not
 
     def get_all_open_time(self):
-        # for binary option turbo and binary
+        """
+        Retorna un diccionario anidado con la disponibilidad de cada activo:
+        {
+          'binary':  { 'EURUSD': {'open': True}, ... },
+          'turbo':   { 'EURUSD-OTC': {'open': False}, ... },
+          'digital': { 'EURUSD-op': {'open': True}, ... },
+          'forex':   { 'EURUSD': {'open': True}, ... },
+          'crypto':  { 'BTCUSD': {'open': True}, ... },
+          'cfd':     { 'GOLD':   {'open': False}, ... }
+        }
+        Cada sección filtra automáticamente entradas inesperadas y respeta
+        el flag real de suspensión ("is_suspended") y horarios de mercado.
+        """
         OPEN_TIME = nested_dict(3, dict)
-        binary_data = self.get_all_init_v2()
-        binary_list = ["binary", "turbo"]
-        for option in binary_list:
-            for actives_id in binary_data[option]["actives"]:
-                active = binary_data[option]["actives"][actives_id]
-                name = str(active["name"]).split(".")[1]
-                if active["enabled"] == True:
-                    if active["is_suspended"] == True:
-                        OPEN_TIME[option][name]["open"] = False
-                    else:
-                        OPEN_TIME[option][name]["open"] = True
-                else:
-                    OPEN_TIME[option][name]["open"] = active["enabled"]
+        now = time.time()
 
-        # for digital
-        digital_data = self.get_digital_underlying_list_data()["underlying"]
-        for digital in digital_data:
-            name = digital["underlying"]
-            schedule = digital["schedule"]
-            OPEN_TIME["digital"][name]["open"] = False
-            for schedule_time in schedule:
-                start = schedule_time["open"]
-                end = schedule_time["close"]
-                if start < time.time() < end:
-                    OPEN_TIME["digital"][name]["open"] = True
+        # ─── Binary y Turbo ────────────────────────────────────────
+        try:
+            init_v2 = self.get_all_init_v2() or {}
+            for fam in ("binary", "turbo"):
+                section = init_v2.get(fam, {})
+                actives = section.get("actives", {})
+                for aid, info in actives.items():
+                    raw_name = info.get("name", "")
+                    name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
+                    enabled    = bool(info.get("enabled", False))
+                    suspended  = bool(info.get("is_suspended", False))
+                    OPEN_TIME[fam][name]["open"] = (enabled and not suspended)
+        except Exception:
+            # Si falla, dejamos binary/turbo vacíos
+            pass
 
-        # for OTHER
-        instrument_list = ["cfd", "forex", "crypto"]
-        for instruments_type in instrument_list:
-            ins_data = self.get_instruments(instruments_type)["instruments"]
-            for detail in ins_data:
-                name = detail["name"]
-                schedule = detail["schedule"]
-                OPEN_TIME[instruments_type][name]["open"] = False
-                for schedule_time in schedule:
-                    start = schedule_time["open"]
-                    end = schedule_time["close"]
-                    if start < time.time() < end:
-                        OPEN_TIME[instruments_type][name]["open"] = True
+        # ─── Digital ────────────────────────────────────────────────
+        try:
+            dig = self.get_digital_underlying_list_data() or {}
+            for entry in dig.get("underlying", []):
+                name     = entry.get("underlying")
+                schedule = entry.get("schedule", []) or []
+                is_open = False
+                for slot in schedule:
+                    start = slot.get("open", 0)
+                    end   = slot.get("close", 0)
+                    if start < now < end:
+                        is_open = True
+                        break
+                OPEN_TIME["digital"][name]["open"] = is_open
+        except Exception:
+            pass
+
+        # ─── Forex, Crypto, CFD ────────────────────────────────────
+        for fam in ("forex", "crypto", "cfd"):
+            try:
+                instruments = self.get_instruments(fam) or {}
+                for detail in instruments.get("instruments", []):
+                    name     = detail.get("name")
+                    schedule = detail.get("schedule", []) or []
+                    is_open = False
+                    for slot in schedule:
+                        start = slot.get("open", 0)
+                        end   = slot.get("close", 0)
+                        if start < now < end:
+                            is_open = True
+                            break
+                    OPEN_TIME[fam][name]["open"] = is_open
+            except Exception:
+                continue
 
         return OPEN_TIME
+
 
     # --------for binary option detail
 
@@ -450,21 +476,44 @@ class IQ_Option:
     # _______________________        CANDLE      _____________________________
     # ________________________self.api.getcandles() wss________________________
 
-    def get_candles(self, ACTIVES, interval, count, endtime):
-        self.api.candles.candles_data = None
-        while True:
-            try:
-                self.api.getcandles(
-                    OP_code.ACTIVES[ACTIVES], interval, count, endtime)
-                while self.check_connect and self.api.candles.candles_data == None:
-                    pass
-                if self.api.candles.candles_data != None:
-                    break
-            except:
-                logging.error('**error** get_candles need reconnect')
-                self.connect()
+    def get_candles(self, asset, interval, count, endtime):
+        """
+        Devuelve lista de velas para `asset` con reintentos y reconexión automática.
+        Lanza excepción si tras varios intentos no logra obtener datos.
+        """
+        from iqoptionapi.constants import ACTIVES  # asegúrate de tener esta importación
 
-        return self.api.candles.candles_data
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                # resetear buffer de datos
+                self.api.candles.candles_data = None
+
+                # lanzar la petición
+                self.api.getcandles(ACTIVES[asset], interval, count, endtime)
+
+                # esperar respuesta durante hasta 10 s
+                start = time.time()
+                while self.api.candles.candles_data is None:
+                    if time.time() - start > 10:
+                        raise TimeoutError(f"Timeout esperando velas para {asset}")
+                    time.sleep(0.1)
+
+                # datos recibidos correctamente
+                return self.api.candles.candles_data
+
+            except Exception as e:
+                logging.error(f"**error** get_candles para {asset} intento {attempt}/{max_retries}: {e}")
+                # intentar reconectar antes del siguiente loop
+                try:
+                    self.connect()
+                except Exception as recon_e:
+                    logging.error(f"**error** reconectando tras fallo de get_candles: {recon_e}")
+                time.sleep(2)  # breve pausa antes de reintentar
+
+        # si agotamos todos los reintentos, subimos excepción
+        raise ConnectionError(f"No se pudo obtener velas para {asset} tras {max_retries} intentos")
+
 
     #######################################################
     # ______________________________________________________
