@@ -250,9 +250,13 @@ class IQ_Option:
 
     # ------- chek if binary/digit/cfd/stock... if open or not
 
+        # ------------------------------------------------------------------
+    #  MÉTODO ROBUSTO: disponibilidad de mercado
+    # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
-        Retorna un diccionario anidado con la disponibilidad de cada activo:
+        Devuelve un diccionario anidado con la bandera 'open' de cada activo.
+        Estructura:
         {
           'binary':  { 'EURUSD': {'open': True}, ... },
           'turbo':   { 'EURUSD-OTC': {'open': False}, ... },
@@ -261,64 +265,55 @@ class IQ_Option:
           'crypto':  { 'BTCUSD': {'open': True}, ... },
           'cfd':     { 'GOLD':   {'open': False}, ... }
         }
-        Cada sección filtra automáticamente entradas inesperadas y respeta
-        el flag real de suspensión ("is_suspended") y horarios de mercado.
+        La función:
+          • Ignora claves inesperadas (p. ej. 'underlying').
+          • Respeta el flag real de suspensión (`is_suspended`).
+          • En caso de error con un tipo de instrumento, no rompe el resto.
         """
         OPEN_TIME = nested_dict(3, dict)
         now = time.time()
 
-        # ─── Binary y Turbo ────────────────────────────────────────
+        # ── 1. Binary y Turbo ───────────────────────────────────────
         try:
             init_v2 = self.get_all_init_v2() or {}
             for fam in ("binary", "turbo"):
-                section = init_v2.get(fam, {})
-                actives = section.get("actives", {})
+                actives = init_v2.get(fam, {}).get("actives", {})
                 for aid, info in actives.items():
-                    raw_name = info.get("name", "")
-                    name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
-                    enabled    = bool(info.get("enabled", False))
-                    suspended  = bool(info.get("is_suspended", False))
-                    OPEN_TIME[fam][name]["open"] = (enabled and not suspended)
-        except Exception:
-            # Si falla, dejamos binary/turbo vacíos
-            pass
+                    raw = info.get("name", "")
+                    name = raw.split(".", 1)[-1] if "." in raw else raw
+                    enabled   = bool(info.get("enabled", False))
+                    suspended = bool(info.get("is_suspended", False))
+                    OPEN_TIME[fam][name]["open"] = enabled and not suspended
+        except Exception as e:
+            logging.error(f"[open_time] binary/turbo error: {e}")
 
-        # ─── Digital ────────────────────────────────────────────────
+        # ── 2. Digital ──────────────────────────────────────────────
         try:
             dig = self.get_digital_underlying_list_data() or {}
             for entry in dig.get("underlying", []):
-                name     = entry.get("underlying")
+                name = entry.get("underlying")
                 schedule = entry.get("schedule", []) or []
-                is_open = False
-                for slot in schedule:
-                    start = slot.get("open", 0)
-                    end   = slot.get("close", 0)
-                    if start < now < end:
-                        is_open = True
-                        break
+                is_open = any(slot.get("open", 0) < now < slot.get("close", 0)
+                              for slot in schedule)
                 OPEN_TIME["digital"][name]["open"] = is_open
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"[open_time] digital error: {e}")
 
-        # ─── Forex, Crypto, CFD ────────────────────────────────────
+        # ── 3. Forex, Crypto, CFD ───────────────────────────────────
         for fam in ("forex", "crypto", "cfd"):
             try:
-                instruments = self.get_instruments(fam) or {}
-                for detail in instruments.get("instruments", []):
-                    name     = detail.get("name")
-                    schedule = detail.get("schedule", []) or []
-                    is_open = False
-                    for slot in schedule:
-                        start = slot.get("open", 0)
-                        end   = slot.get("close", 0)
-                        if start < now < end:
-                            is_open = True
-                            break
+                ins = self.get_instruments(fam) or {}
+                for det in ins.get("instruments", []):
+                    name = det.get("name")
+                    schedule = det.get("schedule", []) or []
+                    is_open = any(slot.get("open", 0) < now < slot.get("close", 0)
+                                  for slot in schedule)
                     OPEN_TIME[fam][name]["open"] = is_open
-            except Exception:
-                continue
+            except Exception as e:
+                logging.error(f"[open_time] {fam} error: {e}")
 
         return OPEN_TIME
+
 
 
     # --------for binary option detail
@@ -472,47 +467,68 @@ class IQ_Option:
             logging.error("ERROR doesn't have this mode")
             exit(1)
 
+    # ────────────────────────────────────────────────────────────
+    # Añade cerca del inicio de la clase IQ_Option (debajo del __init__)
+    # ────────────────────────────────────────────────────────────
+    @staticmethod
+    def normalize_asset_name(asset: str) -> str:
+        """
+        Devuelve el nombre correcto para pedir velas:
+        • EURUSD-op   -> EURUSD   (Digital)
+        • USDJPY-OTC  -> USDJPY   (opcional, por si OTC suspendido)
+        """
+        upper = asset.upper()
+        if upper.endswith("-OP"):
+            return asset[:-3]          # quita "-op"
+        if upper.endswith("-OTC"):
+            # Si necesitas caer a la versión FX: return asset[:-4]
+            return asset               # normalmente las velas OTC sí existen
+        return asset
+
+
     # ________________________________________________________________________
     # _______________________        CANDLE      _____________________________
     # ________________________self.api.getcandles() wss________________________
 
     def get_candles(self, asset, interval, count, endtime):
         """
-        Devuelve lista de velas para `asset` con reintentos y reconexión automática.
-        Lanza excepción si tras varios intentos no logra obtener datos.
+        Devuelve lista de velas con reintentos y reconexión.
+        Compatible con activos Digital (-op) y OTC.
         """
-        from iqoptionapi.constants import ACTIVES  # asegúrate de tener esta importación
+        from iqoptionapi.constants import ACTIVES
 
+        name_for_candles = self.normalize_asset_name(asset)
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                # resetear buffer de datos
                 self.api.candles.candles_data = None
-
-                # lanzar la petición
-                self.api.getcandles(ACTIVES[asset], interval, count, endtime)
-
-                # esperar respuesta durante hasta 10 s
+                self.api.getcandles(
+                    ACTIVES[name_for_candles], interval, count, endtime
+                )
                 start = time.time()
                 while self.api.candles.candles_data is None:
                     if time.time() - start > 10:
-                        raise TimeoutError(f"Timeout esperando velas para {asset}")
+                        raise TimeoutError(f"Timeout {name_for_candles}")
                     time.sleep(0.1)
 
-                # datos recibidos correctamente
                 return self.api.candles.candles_data
 
             except Exception as e:
-                logging.error(f"**error** get_candles para {asset} intento {attempt}/{max_retries}: {e}")
-                # intentar reconectar antes del siguiente loop
+                logging.error(
+                    f"**error** get_candles {asset} intento {attempt}/"
+                    f"{max_retries}: {e}"
+                )
+                # reconexión suave
                 try:
                     self.connect()
-                except Exception as recon_e:
-                    logging.error(f"**error** reconectando tras fallo de get_candles: {recon_e}")
-                time.sleep(2)  # breve pausa antes de reintentar
+                except Exception as re:
+                    logging.error(f"reconnect fail: {re}")
+                time.sleep(2)
 
-        # si agotamos todos los reintentos, subimos excepción
-        raise ConnectionError(f"No se pudo obtener velas para {asset} tras {max_retries} intentos")
+        raise ConnectionError(
+            f"No se pudo obtener velas para {asset} tras {max_retries} intentos"
+        )
+
 
 
     #######################################################
