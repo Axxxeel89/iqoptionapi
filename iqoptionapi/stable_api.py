@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections import deque
 from iqoptionapi.expiration import get_expiration_time, get_remaning_time
 from datetime import datetime, timedelta
+import json
 
 
 def nested_dict(n, type):
@@ -255,79 +256,45 @@ class IQ_Option:
     # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
-        Devuelve un diccionario anidado con la bandera 'open' de cada activo.
-        VERSIÓN ROBUSTA: Se adapta a cambios en la estructura de la API y añade
-        el sufijo '-OP' a los activos digitales para consistencia con el EA.
+        Versión de depuración: Imprime todas las categorías de activos
+        recibidas de la API para descubrir el nombre correcto de las digitales.
         """
         OPEN_TIME = nested_dict(3, dict)
         now = time.time()
+        init_data = self.get_all_init()
 
-        # ── 1. Binary y Turbo (Sin cambios, ya era robusto) ───────────────
+        # --- INICIO DEL CÓDIGO DE DEPURACIÓN ---
+        if "result" in init_data:
+            print("\n--- DEBUG: Tipos de activos recibidos en 'result' ---")
+            print(list(init_data["result"].keys()))
+            print("-----------------------------------------------------\n")
+        else:
+            print("\n--- DEBUG: La respuesta de la API no contiene la llave 'result' ---\n")
+        # --- FIN DEL CÓDIGO DE DEPURACIÓN ---
+
+        # El resto del código intentará ejecutarse normalmente...
         try:
-            init_v2 = self.get_all_init_v2() or {}
             for fam in ("binary", "turbo"):
-                actives = init_v2.get(fam, {}).get("actives", {})
-                for aid, info in actives.items():
+                for aid, info in init_data.get("result", {}).get(fam, {}).get("actives", {}).items():
                     raw_name = info.get("name", "")
                     name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
                     if not name: continue
-                    
-                    enabled = bool(info.get("enabled", False))
-                    suspended = bool(info.get("is_suspended", False))
-                    OPEN_TIME[fam][name]["open"] = enabled and not suspended
+                    is_open = not info.get("is_suspended", False) and info.get("enabled", False)
+                    OPEN_TIME[fam][name]["open"] = is_open
         except Exception as e:
             logging.error(f"[open_time] binary/turbo error: {e}")
 
-        # ── 2. Digital (LÓGICA MEJORADA Y ROBUSTA) ───────────────────────
+        # Intentamos con el nombre que creemos que es correcto ('digital')
         try:
-            raw_digital_data = self.get_digital_underlying_list_data() or []
-            digital_assets_list = []
-
-            # --- Lógica adaptativa para encontrar la lista de activos ---
-            if isinstance(raw_digital_data, dict):
-                # Si es un diccionario, busca la lista en llaves comunes
-                possible_keys = ["instruments", "underlying", "result", "data", "actives"]
-                for key in possible_keys:
-                    if isinstance(raw_digital_data.get(key), list):
-                        digital_assets_list = raw_digital_data[key]
-                        break
-            elif isinstance(raw_digital_data, list):
-                # Si ya es una lista, la usamos directamente
-                digital_assets_list = raw_digital_data
-            
-            if not digital_assets_list:
-                logging.warning("[open_time] No se encontró una lista de activos digitales válida.")
-            
-            for entry in digital_assets_list:
-                # El nombre del activo subyacente (ej: "EURUSD")
-                base_name = entry.get("underlying")
-                if not base_name: continue
-
-                # Le añadimos el sufijo para que el EA lo identifique
-                asset_name_with_suffix = f"{base_name}-OP"
-                
-                schedule = entry.get("schedule", []) or []
-                is_open = any(slot.get("open", 0) < now < slot.get("close", 0) for slot in schedule)
-                
+            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
+            for _, info in digital_actives.items():
+                name = info.get("underlying")
+                if not name: continue
+                asset_name_with_suffix = f"{name}-OP"
+                is_open = not info.get("is_suspended", False) and info.get("enabled", False)
                 OPEN_TIME["digital"][asset_name_with_suffix]["open"] = is_open
-                
         except Exception as e:
             logging.error(f"[open_time] digital error: {e}")
-            traceback.print_exc() # Imprime el traceback completo para depuración
-
-        # ── 3. Forex, Crypto, CFD (Sin cambios) ──────────────────────────
-        for fam in ("forex", "crypto", "cfd"):
-            try:
-                instruments_data = self.get_instruments(fam) or {}
-                for det in instruments_data.get("instruments", []):
-                    name = det.get("name")
-                    if not name: continue
-                    
-                    schedule = det.get("schedule", []) or []
-                    is_open = any(slot.get("open", 0) < now < slot.get("close", 0) for slot in schedule)
-                    OPEN_TIME[fam][name]["open"] = is_open
-            except Exception as e:
-                logging.error(f"[open_time] {fam} error: {e}")
 
         return OPEN_TIME
 
@@ -1016,43 +983,56 @@ class IQ_Option:
     # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/65#issuecomment-513998357
 
     def buy_digital_spot(self, active, amount, action, duration):
-        # Expiration time need to be formatted like this: YYYYMMDDHHII
-        # And need to be on GMT time
+        """
+        Versión final para comprar opciones digitales.
+        Busca el ID del instrumento en los datos de inicialización.
+        """
+        try:
+            init_data = self.get_all_init()
+            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
+            
+            if not digital_actives:
+                return False, "Mercado de digitales no disponible en este momento."
 
-        # Type - P or C
-        if action == 'put':
-            action = 'P'
-        elif action == 'call':
-            action = 'C'
-        else:
-            logging.error('buy_digital_spot active error')
-            return -1
-        # doEURUSD201907191250PT5MPSPT
-        timestamp = int(self.api.timesync.server_timestamp)
-        if duration == 1:
-            exp, _ = get_expiration_time(timestamp, duration)
-        else:
-            now_date = datetime.fromtimestamp(
-                timestamp) + timedelta(minutes=1, seconds=30)
-            while True:
-                if now_date.minute % duration == 0 and time.mktime(now_date.timetuple()) - timestamp > 30:
+            instrument_id = None
+            for _, info in digital_actives.items():
+                if info.get("underlying") == active.upper():
+                    options = info.get("option", {}).get("list", [])
+                    for opt in options:
+                        if opt.get("expiration_len") == duration * 60:
+                            instrument_id = opt.get("id")
+                            break
+                if instrument_id:
                     break
-                now_date = now_date + timedelta(minutes=1)
-            exp = time.mktime(now_date.timetuple())
 
-        dateFormated = str(datetime.utcfromtimestamp(
-            exp).strftime("%Y%m%d%H%M"))
-        instrument_id = "do" + active + dateFormated + \
-                        "PT" + str(duration) + "M" + action + "SPT"
-        self.api.digital_option_placed_id = None
+            if not instrument_id:
+                return False, f"Opción para {duration} min no disponible en {active}."
+            
+            self.api.digital_option_placed_id = None
+            self.api.place_digital_option(instrument_id, amount)
 
-        self.api.place_digital_option(instrument_id, amount)
-        while self.api.digital_option_placed_id == None:
-            pass
-        if isinstance(self.api.digital_option_placed_id, int):
-            return True, self.api.digital_option_placed_id
-        else:
-            return False, self.api.digital_option_placed_id
+            start_time = time.time()
+            timeout_seconds = 10
+            while self.api.digital_option_placed_id is None:
+                if time.time() - start_time > timeout_seconds:
+                    return False, "Timeout: El servidor no respondió a la orden."
+                time.sleep(0.1)
+
+            if isinstance(self.api.digital_option_placed_id, int):
+                # Para que check_win_v3 funcione, algunas versiones necesitan el ID de la posición
+                # que se recibe de forma asíncrona. Esta es una forma de obtenerlo.
+                time.sleep(1.5) # Esperar un poco a que llegue el mensaje de la posición
+                order_data = self.get_async_order(self.api.digital_option_placed_id)
+                if "position-changed" in order_data and "id" in order_data["position-changed"]["msg"]:
+                    return True, order_data["position-changed"]["msg"]["id"]
+                return True, self.api.digital_option_placed_id
+            else:
+                return False, self.api.digital_option_placed_id
+        except Exception as e:
+            logging.error(f"Excepción en buy_digital_spot: {e}")
+            return False, f"Error inesperado en la compra: {e}"
+
+
 
     def get_digital_spot_profit_after_sale(self, position_id):
         def get_instrument_id_to_bid(data, instrument_id):
