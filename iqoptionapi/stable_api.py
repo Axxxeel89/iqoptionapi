@@ -250,64 +250,81 @@ class IQ_Option:
 
     # ------- chek if binary/digit/cfd/stock... if open or not
 
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     #  MÉTODO ROBUSTO: disponibilidad de mercado
     # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
         Devuelve un diccionario anidado con la bandera 'open' de cada activo.
-        Estructura:
-        {
-          'binary':  { 'EURUSD': {'open': True}, ... },
-          'turbo':   { 'EURUSD-OTC': {'open': False}, ... },
-          'digital': { 'EURUSD-op': {'open': True}, ... },
-          'forex':   { 'EURUSD': {'open': True}, ... },
-          'crypto':  { 'BTCUSD': {'open': True}, ... },
-          'cfd':     { 'GOLD':   {'open': False}, ... }
-        }
-        La función:
-          • Ignora claves inesperadas (p. ej. 'underlying').
-          • Respeta el flag real de suspensión (`is_suspended`).
-          • En caso de error con un tipo de instrumento, no rompe el resto.
+        VERSIÓN ROBUSTA: Se adapta a cambios en la estructura de la API y añade
+        el sufijo '-OP' a los activos digitales para consistencia con el EA.
         """
         OPEN_TIME = nested_dict(3, dict)
         now = time.time()
 
-        # ── 1. Binary y Turbo ───────────────────────────────────────
+        # ── 1. Binary y Turbo (Sin cambios, ya era robusto) ───────────────
         try:
             init_v2 = self.get_all_init_v2() or {}
             for fam in ("binary", "turbo"):
                 actives = init_v2.get(fam, {}).get("actives", {})
                 for aid, info in actives.items():
-                    raw = info.get("name", "")
-                    name = raw.split(".", 1)[-1] if "." in raw else raw
-                    enabled   = bool(info.get("enabled", False))
+                    raw_name = info.get("name", "")
+                    name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
+                    if not name: continue
+                    
+                    enabled = bool(info.get("enabled", False))
                     suspended = bool(info.get("is_suspended", False))
                     OPEN_TIME[fam][name]["open"] = enabled and not suspended
         except Exception as e:
             logging.error(f"[open_time] binary/turbo error: {e}")
 
-        # ── 2. Digital ──────────────────────────────────────────────
+        # ── 2. Digital (LÓGICA MEJORADA Y ROBUSTA) ───────────────────────
         try:
-            dig = self.get_digital_underlying_list_data() or {}
-            for entry in dig.get("underlying", []):
-                name = entry.get("underlying")
+            raw_digital_data = self.get_digital_underlying_list_data() or []
+            digital_assets_list = []
+
+            # --- Lógica adaptativa para encontrar la lista de activos ---
+            if isinstance(raw_digital_data, dict):
+                # Si es un diccionario, busca la lista en llaves comunes
+                possible_keys = ["instruments", "underlying", "result", "data", "actives"]
+                for key in possible_keys:
+                    if isinstance(raw_digital_data.get(key), list):
+                        digital_assets_list = raw_digital_data[key]
+                        break
+            elif isinstance(raw_digital_data, list):
+                # Si ya es una lista, la usamos directamente
+                digital_assets_list = raw_digital_data
+            
+            if not digital_assets_list:
+                logging.warning("[open_time] No se encontró una lista de activos digitales válida.")
+            
+            for entry in digital_assets_list:
+                # El nombre del activo subyacente (ej: "EURUSD")
+                base_name = entry.get("underlying")
+                if not base_name: continue
+
+                # Le añadimos el sufijo para que el EA lo identifique
+                asset_name_with_suffix = f"{base_name}-OP"
+                
                 schedule = entry.get("schedule", []) or []
-                is_open = any(slot.get("open", 0) < now < slot.get("close", 0)
-                              for slot in schedule)
-                OPEN_TIME["digital"][name]["open"] = is_open
+                is_open = any(slot.get("open", 0) < now < slot.get("close", 0) for slot in schedule)
+                
+                OPEN_TIME["digital"][asset_name_with_suffix]["open"] = is_open
+                
         except Exception as e:
             logging.error(f"[open_time] digital error: {e}")
+            traceback.print_exc() # Imprime el traceback completo para depuración
 
-        # ── 3. Forex, Crypto, CFD ───────────────────────────────────
+        # ── 3. Forex, Crypto, CFD (Sin cambios) ──────────────────────────
         for fam in ("forex", "crypto", "cfd"):
             try:
-                ins = self.get_instruments(fam) or {}
-                for det in ins.get("instruments", []):
+                instruments_data = self.get_instruments(fam) or {}
+                for det in instruments_data.get("instruments", []):
                     name = det.get("name")
+                    if not name: continue
+                    
                     schedule = det.get("schedule", []) or []
-                    is_open = any(slot.get("open", 0) < now < slot.get("close", 0)
-                                  for slot in schedule)
+                    is_open = any(slot.get("open", 0) < now < slot.get("close", 0) for slot in schedule)
                     OPEN_TIME[fam][name]["open"] = is_open
             except Exception as e:
                 logging.error(f"[open_time] {fam} error: {e}")
