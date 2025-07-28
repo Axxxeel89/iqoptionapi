@@ -255,24 +255,11 @@ class IQ_Option:
     #  MÉTODO ROBUSTO: disponibilidad de mercado
     # ------------------------------------------------------------------
     def get_all_open_time(self):
-        """
-        Versión de depuración: Imprime todas las categorías de activos
-        recibidas de la API para descubrir el nombre correcto de las digitales.
-        """
         OPEN_TIME = nested_dict(3, dict)
-        now = time.time()
         init_data = self.get_all_init()
 
-        # --- INICIO DEL CÓDIGO DE DEPURACIÓN ---
-        if "result" in init_data:
-            print("\n--- DEBUG: Tipos de activos recibidos en 'result' ---")
-            print(list(init_data["result"].keys()))
-            print("-----------------------------------------------------\n")
-        else:
-            print("\n--- DEBUG: La respuesta de la API no contiene la llave 'result' ---\n")
-        # --- FIN DEL CÓDIGO DE DEPURACIÓN ---
-
-        # El resto del código intentará ejecutarse normalmente...
+        # --- 1. PROCESAR ACTIVOS TRADICIONALES (Binary, Turbo) ---
+        # (Esta parte funciona y la mantenemos)
         try:
             for fam in ("binary", "turbo"):
                 for aid, info in init_data.get("result", {}).get(fam, {}).get("actives", {}).items():
@@ -284,20 +271,26 @@ class IQ_Option:
         except Exception as e:
             logging.error(f"[open_time] binary/turbo error: {e}")
 
-        # Intentamos con el nombre que creemos que es correcto ('digital')
+        # --- 2. PROCESAR ACTIVOS MODERNOS (Digital, Forex, Crypto, CFD) ---
+        # (Esta es la nueva lógica que reemplaza la búsqueda de "digital")
         try:
-            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
-            for _, info in digital_actives.items():
-                name = info.get("underlying")
-                if not name: continue
-                asset_name_with_suffix = f"{name}-OP"
-                is_open = not info.get("is_suspended", False) and info.get("enabled", False)
-                OPEN_TIME["digital"][asset_name_with_suffix]["open"] = is_open
+            # Pedimos la lista completa de todos los tipos de "instrumentos"
+            all_instruments = self.get_instruments("crypto,forex,cfd,digital-option")
+            if all_instruments and "instruments" in all_instruments:
+                for instrument in all_instruments["instruments"]:
+                    asset_type = instrument.get("type")
+                    name = instrument.get("name")
+                    is_open = instrument.get("is_enabled", False) and not instrument.get("is_suspended", False)
+                    
+                    # Mapeamos el tipo de instrumento a una categoría familiar
+                    family = "digital" if asset_type == "digital-option" else asset_type
+                    
+                    if name and family:
+                        OPEN_TIME[family][name]["open"] = is_open
         except Exception as e:
-            logging.error(f"[open_time] digital error: {e}")
+            logging.error(f"[open_time] instruments error: {e}")
 
         return OPEN_TIME
-
 
 
     # --------for binary option detail
