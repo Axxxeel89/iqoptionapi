@@ -11,6 +11,7 @@ from collections import defaultdict
 from collections import deque
 from iqoptionapi.expiration import get_expiration_time, get_remaning_time
 from datetime import datetime, timedelta
+import json
 
 
 def nested_dict(n, type):
@@ -250,50 +251,54 @@ class IQ_Option:
 
     # ------- chek if binary/digit/cfd/stock... if open or not
 
+    # ------------------------------------------------------------------
+    #  MÉTODO ROBUSTO: disponibilidad de mercado
+    # ------------------------------------------------------------------
     def get_all_open_time(self):
-        # for binary option turbo and binary
+        """
+        Versión de depuración: Imprime todas las categorías de activos
+        recibidas de la API para descubrir el nombre correcto de las digitales.
+        """
         OPEN_TIME = nested_dict(3, dict)
-        binary_data = self.get_all_init_v2()
-        binary_list = ["binary", "turbo"]
-        for option in binary_list:
-            for actives_id in binary_data[option]["actives"]:
-                active = binary_data[option]["actives"][actives_id]
-                name = str(active["name"]).split(".")[1]
-                if active["enabled"] == True:
-                    if active["is_suspended"] == True:
-                        OPEN_TIME[option][name]["open"] = False
-                    else:
-                        OPEN_TIME[option][name]["open"] = True
-                else:
-                    OPEN_TIME[option][name]["open"] = active["enabled"]
+        now = time.time()
+        init_data = self.get_all_init()
 
-        # for digital
-        digital_data = self.get_digital_underlying_list_data()["underlying"]
-        for digital in digital_data:
-            name = digital["underlying"]
-            schedule = digital["schedule"]
-            OPEN_TIME["digital"][name]["open"] = False
-            for schedule_time in schedule:
-                start = schedule_time["open"]
-                end = schedule_time["close"]
-                if start < time.time() < end:
-                    OPEN_TIME["digital"][name]["open"] = True
+        # --- INICIO DEL CÓDIGO DE DEPURACIÓN ---
+        if "result" in init_data:
+            print("\n--- DEBUG: Tipos de activos recibidos en 'result' ---")
+            print(list(init_data["result"].keys()))
+            print("-----------------------------------------------------\n")
+        else:
+            print("\n--- DEBUG: La respuesta de la API no contiene la llave 'result' ---\n")
+        # --- FIN DEL CÓDIGO DE DEPURACIÓN ---
 
-        # for OTHER
-        instrument_list = ["cfd", "forex", "crypto"]
-        for instruments_type in instrument_list:
-            ins_data = self.get_instruments(instruments_type)["instruments"]
-            for detail in ins_data:
-                name = detail["name"]
-                schedule = detail["schedule"]
-                OPEN_TIME[instruments_type][name]["open"] = False
-                for schedule_time in schedule:
-                    start = schedule_time["open"]
-                    end = schedule_time["close"]
-                    if start < time.time() < end:
-                        OPEN_TIME[instruments_type][name]["open"] = True
+        # El resto del código intentará ejecutarse normalmente...
+        try:
+            for fam in ("binary", "turbo"):
+                for aid, info in init_data.get("result", {}).get(fam, {}).get("actives", {}).items():
+                    raw_name = info.get("name", "")
+                    name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
+                    if not name: continue
+                    is_open = not info.get("is_suspended", False) and info.get("enabled", False)
+                    OPEN_TIME[fam][name]["open"] = is_open
+        except Exception as e:
+            logging.error(f"[open_time] binary/turbo error: {e}")
+
+        # Intentamos con el nombre que creemos que es correcto ('digital')
+        try:
+            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
+            for _, info in digital_actives.items():
+                name = info.get("underlying")
+                if not name: continue
+                asset_name_with_suffix = f"{name}-OP"
+                is_open = not info.get("is_suspended", False) and info.get("enabled", False)
+                OPEN_TIME["digital"][asset_name_with_suffix]["open"] = is_open
+        except Exception as e:
+            logging.error(f"[open_time] digital error: {e}")
 
         return OPEN_TIME
+
+
 
     # --------for binary option detail
 
@@ -446,25 +451,69 @@ class IQ_Option:
             logging.error("ERROR doesn't have this mode")
             exit(1)
 
+    # ────────────────────────────────────────────────────────────
+    # Añade cerca del inicio de la clase IQ_Option (debajo del __init__)
+    # ────────────────────────────────────────────────────────────
+    @staticmethod
+    def normalize_asset_name(asset: str) -> str:
+        """
+        Devuelve el nombre correcto para pedir velas:
+        • EURUSD-op   -> EURUSD   (Digital)
+        • USDJPY-OTC  -> USDJPY   (opcional, por si OTC suspendido)
+        """
+        upper = asset.upper()
+        if upper.endswith("-OP"):
+            return asset[:-3]          # quita "-op"
+        if upper.endswith("-OTC"):
+            # Si necesitas caer a la versión FX: return asset[:-4]
+            return asset               # normalmente las velas OTC sí existen
+        return asset
+
+
     # ________________________________________________________________________
     # _______________________        CANDLE      _____________________________
     # ________________________self.api.getcandles() wss________________________
 
-    def get_candles(self, ACTIVES, interval, count, endtime):
-        self.api.candles.candles_data = None
-        while True:
-            try:
-                self.api.getcandles(
-                    OP_code.ACTIVES[ACTIVES], interval, count, endtime)
-                while self.check_connect and self.api.candles.candles_data == None:
-                    pass
-                if self.api.candles.candles_data != None:
-                    break
-            except:
-                logging.error('**error** get_candles need reconnect')
-                self.connect()
+    def get_candles(self, asset, interval, count, endtime):
+        """
+        Devuelve lista de velas con reintentos y reconexión.
+        Compatible con activos Digital (-op) y OTC.
+        """
+        from iqoptionapi.constants import ACTIVES
 
-        return self.api.candles.candles_data
+        name_for_candles = self.normalize_asset_name(asset)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.api.candles.candles_data = None
+                self.api.getcandles(
+                    ACTIVES[name_for_candles], interval, count, endtime
+                )
+                start = time.time()
+                while self.api.candles.candles_data is None:
+                    if time.time() - start > 10:
+                        raise TimeoutError(f"Timeout {name_for_candles}")
+                    time.sleep(0.1)
+
+                return self.api.candles.candles_data
+
+            except Exception as e:
+                logging.error(
+                    f"**error** get_candles {asset} intento {attempt}/"
+                    f"{max_retries}: {e}"
+                )
+                # reconexión suave
+                try:
+                    self.connect()
+                except Exception as re:
+                    logging.error(f"reconnect fail: {re}")
+                time.sleep(2)
+
+        raise ConnectionError(
+            f"No se pudo obtener velas para {asset} tras {max_retries} intentos"
+        )
+
+
 
     #######################################################
     # ______________________________________________________
@@ -934,43 +983,56 @@ class IQ_Option:
     # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/65#issuecomment-513998357
 
     def buy_digital_spot(self, active, amount, action, duration):
-        # Expiration time need to be formatted like this: YYYYMMDDHHII
-        # And need to be on GMT time
+        """
+        Versión final para comprar opciones digitales.
+        Busca el ID del instrumento en los datos de inicialización.
+        """
+        try:
+            init_data = self.get_all_init()
+            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
+            
+            if not digital_actives:
+                return False, "Mercado de digitales no disponible en este momento."
 
-        # Type - P or C
-        if action == 'put':
-            action = 'P'
-        elif action == 'call':
-            action = 'C'
-        else:
-            logging.error('buy_digital_spot active error')
-            return -1
-        # doEURUSD201907191250PT5MPSPT
-        timestamp = int(self.api.timesync.server_timestamp)
-        if duration == 1:
-            exp, _ = get_expiration_time(timestamp, duration)
-        else:
-            now_date = datetime.fromtimestamp(
-                timestamp) + timedelta(minutes=1, seconds=30)
-            while True:
-                if now_date.minute % duration == 0 and time.mktime(now_date.timetuple()) - timestamp > 30:
+            instrument_id = None
+            for _, info in digital_actives.items():
+                if info.get("underlying") == active.upper():
+                    options = info.get("option", {}).get("list", [])
+                    for opt in options:
+                        if opt.get("expiration_len") == duration * 60:
+                            instrument_id = opt.get("id")
+                            break
+                if instrument_id:
                     break
-                now_date = now_date + timedelta(minutes=1)
-            exp = time.mktime(now_date.timetuple())
 
-        dateFormated = str(datetime.utcfromtimestamp(
-            exp).strftime("%Y%m%d%H%M"))
-        instrument_id = "do" + active + dateFormated + \
-                        "PT" + str(duration) + "M" + action + "SPT"
-        self.api.digital_option_placed_id = None
+            if not instrument_id:
+                return False, f"Opción para {duration} min no disponible en {active}."
+            
+            self.api.digital_option_placed_id = None
+            self.api.place_digital_option(instrument_id, amount)
 
-        self.api.place_digital_option(instrument_id, amount)
-        while self.api.digital_option_placed_id == None:
-            pass
-        if isinstance(self.api.digital_option_placed_id, int):
-            return True, self.api.digital_option_placed_id
-        else:
-            return False, self.api.digital_option_placed_id
+            start_time = time.time()
+            timeout_seconds = 10
+            while self.api.digital_option_placed_id is None:
+                if time.time() - start_time > timeout_seconds:
+                    return False, "Timeout: El servidor no respondió a la orden."
+                time.sleep(0.1)
+
+            if isinstance(self.api.digital_option_placed_id, int):
+                # Para que check_win_v3 funcione, algunas versiones necesitan el ID de la posición
+                # que se recibe de forma asíncrona. Esta es una forma de obtenerlo.
+                time.sleep(1.5) # Esperar un poco a que llegue el mensaje de la posición
+                order_data = self.get_async_order(self.api.digital_option_placed_id)
+                if "position-changed" in order_data and "id" in order_data["position-changed"]["msg"]:
+                    return True, order_data["position-changed"]["msg"]["id"]
+                return True, self.api.digital_option_placed_id
+            else:
+                return False, self.api.digital_option_placed_id
+        except Exception as e:
+            logging.error(f"Excepción en buy_digital_spot: {e}")
+            return False, f"Error inesperado en la compra: {e}"
+
+
 
     def get_digital_spot_profit_after_sale(self, position_id):
         def get_instrument_id_to_bid(data, instrument_id):
