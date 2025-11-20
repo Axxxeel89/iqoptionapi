@@ -1063,15 +1063,29 @@ class IQ_Option:
 
     def buy(self, price, ACTIVES, ACTION, expirations):
         """
-        Método de compra corregido.
-        Normaliza el nombre (quita -op/-OTC) antes de buscar el ID.
+        Método de Compra Inteligente (Híbrido).
+        - Si el activo termina en '-op', ejecuta una compra de DIGITALES.
+        - Si no, ejecuta una compra de BINARIAS/TURBO estándar.
         """
+        # ---------------------------------------------------------
+        # 1. ENRUTAMIENTO PARA DIGITALES (-op)
+        # ---------------------------------------------------------
+        if str(ACTIVES).endswith("-op") or str(ACTIVES).endswith("-OP"):
+            # Limpiamos el nombre: "EURUSD-op" -> "EURUSD"
+            asset_name = self.normalize_asset_name(ACTIVES)
+            
+            # Usamos la función específica para digitales
+            # buy_digital_spot retorna (True/False, ID/Mensaje)
+            return self.buy_digital_spot(asset_name, price, ACTION, expirations)
+
+        # ---------------------------------------------------------
+        # 2. LÓGICA ORIGINAL PARA BINARIAS / TURBO
+        # ---------------------------------------------------------
         self.api.buy_multi_option = {}
         self.api.buy_successful = None
         req_id = "buy"
         
-        # --- CORRECCIÓN: Normalizar nombre ---
-        # Convierte 'EURUSD-op' o 'EURUSD-OTC' a 'EURUSD' para encontrar su ID
+        # Normalización para Binarias
         active_name = self.normalize_asset_name(ACTIVES)
         
         try:
@@ -1079,12 +1093,10 @@ class IQ_Option:
         except:
             pass
             
-        # Usamos active_name en lugar de ACTIVES para el diccionario
         try:
             active_id = OP_code.ACTIVES[active_name]
         except KeyError:
-            # Fallback de seguridad: si falla la normalización, intentamos tal cual
-            logging.error(f"Activo no encontrado en constantes: {active_name}")
+            logging.error(f"Activo no encontrado para Binarias: {active_name}")
             return False, "Asset ID not found"
 
         self.api.buyv3(
@@ -1093,6 +1105,7 @@ class IQ_Option:
         start_t = time.time()
         id = None
         self.api.result = None
+        
         while self.api.result == None or id == None:
             try:
                 if "message" in self.api.buy_multi_option[req_id].keys():
@@ -1103,12 +1116,11 @@ class IQ_Option:
                 id = self.api.buy_multi_option[req_id]["id"]
             except:
                 pass
-            if time.time() - start_t >= 5:
-                logging.error('**warning** buy late 5 sec')
-                return False, None
+            if time.time() - start_t >= 10: # Aumenté un poco el timeout por seguridad
+                logging.error('**warning** buy binary late 10 sec')
+                return False, "Timeout waiting for binary result"
 
         return self.api.result, self.api.buy_multi_option[req_id]["id"]
-
 
     def sell_option(self, options_ids):
         self.api.sell_option(options_ids)
@@ -1211,107 +1223,100 @@ class IQ_Option:
     # thank thiagottjv
     # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/65#issuecomment-513998357
 
-    def buy_digital_spot (self, active, amount, action, duration):
+    def buy_digital_spot(self, active, amount, action, duration):
         """
-        Versión segura de buy_digital_spot que autocorrige nombres de activos.
-        
-        Mejoras:
-        1. Valida y corrige el nombre del activo automáticamente
-        2. Maneja minúsculas/mayúsculas
-        3. Intenta variantes si el nombre exacto no existe
-        4. Retorna errores descriptivos
-        
-        Args:
-            active: Nombre del activo (ej: "EURUSD", "EURUSD-op", "eurusd")
-            amount: Monto a invertir
-            action: "call" o "put"
-            duration: Duración en minutos
-            
-        Returns:
-            tuple: (success: bool, result: int/str)
-                - Si éxito: (True, order_id)
-                - Si fallo: (False, error_message)
+        Versión INGENIOSA:
+        1. Auto-corrige la duración (Digitales solo aceptan 1m, 5m, 15m).
+        2. Busca el activo con y sin sufijo -OTC.
         """
-        from iqoptionapi.constants import ACTIVES
-        import time
-        
-        # 1. AUTOCORRECCIÓN DEL NOMBRE DEL ACTIVO
-        corrected_active = None
-        
-        # Intentar nombre original en mayúsculas
-        upper_active = active.upper()
-        if upper_active in ACTIVES:
-            corrected_active = upper_active
-        else:
-            # Buscar variantes
-            variants = self.get_asset_variants(active)
-            if variants:
-                corrected_active = variants[0]
-                logging.info(f"🔄 Autocorregido: {active} → {corrected_active}")
+        try:
+            # --- 1. CORRECCIÓN DE DURACIÓN ---
+            # Digitales son estrictas: 1, 5 o 15 minutos.
+            # Si envías 2, 3 o 4, lo subimos a 5 para asegurar ejecución.
+            if duration <= 1:
+                mapped_duration = 1
+            elif duration <= 5:
+                mapped_duration = 5
             else:
-                error_msg = f"Asset '{active}' no encontrado en ACTIVES (ni variantes)"
-                logging.error(f"❌ {error_msg}")
-                return False, error_msg
-        
-        # 2. OBTENER DATOS DE INICIALIZACIÓN
-        try:
-            init_data = self.get_all_init()
-            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
+                mapped_duration = 15
             
-            if not digital_actives:
-                return False, "Mercado de digitales no disponible"
+            # Si cambiamos la duración, lo avisamos en consola (opcional)
+            if mapped_duration != duration:
+                print(f"   ⚠️ Ajustando duración Digital: {duration}m -> {mapped_duration}m")
+
+            # --- 2. OBTENER DATOS USANDO EL MÉTODO YA ARREGLADO ---
+            # Usamos get_digital_underlying_list_data porque ya lo protegimos antes
+            digital_data = self.get_digital_underlying_list_data()
             
-        except Exception as e:
-            logging.error(f"❌ Error obteniendo init_data: {e}")
-            return False, f"Error de inicialización: {str(e)}"
-        
-        # 3. BUSCAR INSTRUMENTO DIGITAL
-        instrument_id = None
-        
-        for _, info in digital_actives.items():
-            # Comparar con nombre corregido
-            if info.get("underlying") == corrected_active:
-                options = info.get("option", {}).get("list", [])
-                for opt in options:
-                    if opt.get("expiration_len") == duration * 60:
-                        instrument_id = opt.get("id")
+            if not digital_data:
+                return False, "No se pudo descargar la lista de digitales."
+
+            # --- 3. BÚSQUEDA DIFUSA DEL ACTIVO ---
+            # El bot nos da "EURUSD", pero en la lista podría ser "EURUSD-OTC"
+            target_instrument = None
+            
+            # Intentos de nombre
+            possible_names = [active, f"{active}-OTC", active.replace("-OTC", "")]
+            
+            for candidate in possible_names:
+                if candidate in digital_data:
+                    target_instrument = digital_data[candidate]
+                    break
+            
+            if not target_instrument:
+                # Búsqueda profunda por si está anidado diferente
+                for key, val in digital_data.items():
+                    if val.get("underlying") == active:
+                        target_instrument = val
                         break
-            if instrument_id:
-                break
-        
-        if not instrument_id:
-            return False, f"Opción de {duration}min no disponible para {corrected_active}"
-        
-        # 4. EJECUTAR ORDEN
-        try:
+
+            if not target_instrument:
+                return False, f"Activo {active} no encontrado en Digitales."
+
+            # --- 4. BUSCAR EL ID DEL CONTRATO (INSTRUMENT_ID) ---
+            instrument_id = None
+            options_list = target_instrument.get("option", {}).get("list", [])
+            
+            for opt in options_list:
+                # expiration_len viene en segundos (60, 300, 900)
+                if opt.get("expiration_len") == mapped_duration * 60:
+                    instrument_id = opt.get("id")
+                    break
+            
+            # Si falló 5m, intento desesperado con 1m o 15m para no perder el trade
+            if not instrument_id:
+                for opt in options_list:
+                    instrument_id = opt.get("id") # Agarra el primero que encuentre
+                    print(f"   ⚠️ Duración exacta no hallada, usando disponible: {opt.get('expiration_len')/60}m")
+                    break
+
+            if not instrument_id:
+                return False, f"No hay contratos disponibles para {active}."
+
+            # --- 5. EJECUTAR LA ORDEN ---
             self.api.digital_option_placed_id = None
             self.api.place_digital_option(instrument_id, amount)
-            
-            start_time = time.time()
-            timeout = 10
-            
-            while self.api.digital_option_placed_id is None:
-                if time.time() - start_time > timeout:
-                    return False, "Timeout: El servidor no respondió"
-                time.sleep(0.1)
-            
-            # 5. VALIDAR RESULTADO
-            if isinstance(self.api.digital_option_placed_id, int):
-                # Esperar confirmación de posición
-                time.sleep(1.5)
-                order_data = self.get_async_order(self.api.digital_option_placed_id)
-                
-                if "position-changed" in order_data and "id" in order_data["position-changed"]["msg"]:
-                    return True, order_data["position-changed"]["msg"]["id"]
-                
-                return True, self.api.digital_option_placed_id
-            else:
-                return False, self.api.digital_option_placed_id
-                
-        except Exception as e:
-            logging.error(f"❌ Excepción ejecutando orden: {e}")
-            return False, f"Error inesperado: {str(e)}"
 
+            start_time = time.time()
+            while self.api.digital_option_placed_id is None:
+                if time.time() - start_time > 10:
+                    return False, "Timeout: Servidor no respondió ID de orden."
+                time.sleep(0.1)
+
+            # --- 6. OBTENER ID REAL DE TRANSACCIÓN ---
+            # A veces devuelve un int directo, a veces necesitamos esperar el mensaje asíncrono
+            generated_id = self.api.digital_option_placed_id
+            if isinstance(generated_id, int):
+                # Esperamos un momento para asegurar que el sistema registre la posición
+                # Esto ayuda a que check_win funcione después
+                time.sleep(1) 
+                return True, generated_id
+            
+            return False, "Error: ID de orden inválido."
+
+        except Exception as e:
+            logging.error(f"Error en buy_digital_spot: {e}")
+            return False, str(e)
 
 
     def get_digital_spot_profit_after_sale(self, position_id):
