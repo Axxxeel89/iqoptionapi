@@ -41,6 +41,12 @@ class IQ_Option:
         self.SESSION_HEADER = {
             "User-Agent": r"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.139 Safari/537.36"}
         self.SESSION_COOKIE = {}
+
+        self.asset_cache = {}        # Guarda el nombre correcto del activo
+        self.failed_assets = set()   # Lista negra temporal
+        self.last_cache_reset = time.time()
+
+
         #
 
         # --start
@@ -135,6 +141,8 @@ class IQ_Option:
         else:
             return True
         # wait for timestamp getting
+        
+
 
     # _________________________UPDATE ACTIVES OPCODE_____________________
     def get_all_ACTIVES_OPCODE(self):
@@ -256,87 +264,146 @@ class IQ_Option:
     # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
-        Método actualizado para obtener el estado de apertura de los activos.
-        Protegido contra cambios de estructura API y tiempos de carga.
+        Versión robusta del método original con mejor manejo de errores.
+        
+        Mejoras:
+        1. Timeout de 10s en lugar de espera infinita
+        2. Estructura defensiva contra cambios de API
+        3. Logging detallado de errores
+        4. Retorna dict vacío en lugar de crash si falla
         """
-        # Estructura de retorno esperada: OPEN_TIME['turbo']['EURUSD']['open'] = True
+        from collections import defaultdict
+        
+        def nested_dict(n, type_):
+            if n == 1:
+                return defaultdict(type_)
+            else:
+                return defaultdict(lambda: nested_dict(n - 1, type_))
+        
         OPEN_TIME = nested_dict(3, dict)
         
-        # 1. Forzar actualización de datos iniciales (Binary & Turbo)
-        # Esto puebla self.api.instruments internamente
-        self.get_all_init()
-
+        # 1. Obtener datos de inicialización con timeout
+        try:
+            init_result = self._get_init_with_timeout(timeout=10)
+            if not init_result:
+                logging.error("❌ get_all_open_time: No se pudo obtener init_result")
+                return OPEN_TIME
+        except Exception as e:
+            logging.error(f"❌ Error en get_all_init: {e}")
+            return OPEN_TIME
+        
         # 2. Procesar BINARY y TURBO
-        # Intentamos leer de 'instruments' primero (más fiable), si no, del 'init_result'
         try:
-            # Fuentes de datos
-            sources = {}
+            result = init_result.get("result", {})
             
-            # Si instruments ya cargó, lo usamos
-            if hasattr(self.api, 'instruments') and self.api.instruments:
-                sources['turbo'] = self.api.instruments.get('turbo', {})
-                sources['binary'] = self.api.instruments.get('binary', {})
-            # Si no, usamos el resultado de get_all_init
-            elif self.api.api_option_init_all_result:
-                res = self.api.api_option_init_all_result.get('result', {})
-                sources['turbo'] = res.get('turbo', {}).get('actives', {})
-                sources['binary'] = res.get('binary', {}).get('actives', {})
-
-            # Iterar y llenar el diccionario
-            for type_name, actives_dict in sources.items():
-                for _, info in actives_dict.items():
-                    if not isinstance(info, dict): continue
+            for option_type in ["turbo", "binary"]:
+                actives = result.get(option_type, {}).get("actives", {})
+                
+                for active_id, info in actives.items():
+                    if not isinstance(info, dict):
+                        continue
                     
-                    # Obtener nombre limpio (ej: "front.EURUSD" -> "EURUSD")
-                    name = info.get('name', '')
-                    if 'front.' in name:
-                        name = name.split('.')[-1]
+                    # Extraer nombre limpio
+                    name = info.get("name", "")
+                    if "." in name:
+                        name = name.split(".")[-1]
                     
-                    if not name: continue
-
-                    # Determinar si está abierto
-                    # Prioridad: 'open' -> 'enabled'
-                    is_open = info.get('open', info.get('enabled', False))
-                    is_suspended = info.get('is_suspended', False)
+                    if not name:
+                        continue
                     
-                    if is_open and not is_suspended:
-                        OPEN_TIME[type_name][name]['open'] = True
-                    else:
-                        OPEN_TIME[type_name][name]['open'] = False
-
-        except Exception as e:
-            logging.error(f"Error procesando Binary/Turbo: {e}")
-
-        # 3. Procesar DIGITALES (Con el fix de 'underlying')
-        try:
-            digital_raw = self.get_digital_underlying_list_data()
-            digital_data = {}
-            
-            # Lógica inteligente para encontrar los datos
-            if isinstance(digital_raw, dict):
-                if 'underlying' in digital_raw:
-                    digital_data = digital_raw['underlying']
-                else:
-                    # Si la estructura cambió y no hay 'underlying', asumimos que es la raíz
-                    digital_data = digital_raw
-            
-            # Procesar lista digital
-            if isinstance(digital_data, dict):
-                for name, info in digital_data.items():
-                    # Digitales suelen venir como "EURUSD-OTC" o "EURUSD"
-                    # Asumimos que si están en la lista, podrían estar abiertos, 
-                    # pero verificamos 'schedule' si existe. Por defecto True para no bloquear.
+                    # Determinar estado
+                    is_open = info.get("open", info.get("enabled", False))
+                    is_suspended = info.get("is_suspended", False)
                     
-                    # Nombre para el EA (Añadimos sufijo si es necesario para diferenciar)
-                    display_name = name
-                    
-                    OPEN_TIME['digital'][display_name]['open'] = True
+                    OPEN_TIME[option_type][name]["open"] = (is_open and not is_suspended)
                     
         except Exception as e:
-            logging.error(f"Error procesando Digitales: {e}")
-
+            logging.error(f"❌ Error procesando Binary/Turbo: {e}")
+        
+        # 3. Procesar DIGITALES
+        try:
+            digital_data = self._get_digital_data_safe()
+            
+            for name, info in digital_data.items():
+                # Para digitales, si están en la lista, asumimos que están disponibles
+                OPEN_TIME["digital"][name]["open"] = True
+                
+        except Exception as e:
+            logging.error(f"❌ Error procesando Digitales: {e}")
+        
         return OPEN_TIME
-
+    
+    def _get_digital_data_safe(self):
+        """
+        Obtiene datos digitales con manejo robusto de estructuras variables.
+        """
+        try:
+            raw_data = self.get_digital_underlying_list_data()
+            
+            if not raw_data or not isinstance(raw_data, dict):
+                return {}
+            
+            # Intentar estructura con 'underlying'
+            if "underlying" in raw_data:
+                return raw_data["underlying"]
+            
+            # Estructura plana (fallback)
+            return raw_data
+            
+        except Exception as e:
+            logging.error(f"Error obteniendo digitales: {e}")
+            return {}
+    
+    def _get_init_with_timeout(self, timeout=10):
+        """
+        Obtiene init_result con timeout para evitar bloqueos.
+        """
+        self.api.api_option_init_all_result = None
+        
+        try:
+            self.api.get_api_option_init_all()
+        except Exception as e:
+            logging.error(f"Error llamando get_api_option_init_all: {e}")
+            return None
+        
+        start = time.time()
+        while self.api.api_option_init_all_result is None:
+            if time.time() - start > timeout:
+                logging.warning(f"Timeout esperando init_result ({timeout}s)")
+                return None
+            time.sleep(0.1)
+        
+        return self.api.api_option_init_all_result
+    
+    def is_asset_available(self, asset):
+        """
+        Verifica rápidamente si un activo está disponible sin obtener velas.
+        
+        Args:
+            asset: Nombre del activo
+            
+        Returns:
+            bool: True si el activo existe en ACTIVES
+        """
+        from iqoptionapi.constants import ACTIVES
+        variants = self.get_asset_variants(asset)
+        return len(variants) > 0
+    
+    def get_valid_asset_name(self, asset):
+        """
+        Obtiene el nombre válido del activo desde el caché o variantes.
+        
+        Args:
+            asset: Nombre del activo
+            
+        Returns:
+            str: Nombre válido o None si no existe
+        """
+        if asset in self.asset_cache:
+            return self.asset_cache[asset]
+        
+        variants = self.get_asset_variants(asset)
+        return variants[0] if variants else None
 
     # --------for binary option detail
 
@@ -495,18 +562,50 @@ class IQ_Option:
     @staticmethod
     def normalize_asset_name(asset: str) -> str:
         """
-        Devuelve el nombre correcto para pedir velas:
-        • EURUSD-op   -> EURUSD   (Digital)
-        • USDJPY-OTC  -> USDJPY   (opcional, por si OTC suspendido)
+        Normaliza el nombre del activo al formato base.
+        EURUSD-OTC -> EURUSD
+        XAUUSD-op -> XAUUSD
         """
         upper = asset.upper()
         if upper.endswith("-OP"):
-            return asset[:-3]          # quita "-op"
+            return asset[:-3]
         if upper.endswith("-OTC"):
-            # Si necesitas caer a la versión FX: return asset[:-4]
-            return asset               # normalmente las velas OTC sí existen
+            return asset[:-4]
         return asset
-
+    
+    def get_asset_variants(self, asset: str) -> list:
+        """
+        Genera todas las variantes posibles de un nombre de activo.
+        Prioriza la variante original y luego intenta alternativas.
+        
+        Returns:
+            Lista ordenada de variantes a intentar
+        """
+        from iqoptionapi.constants import ACTIVES
+        
+        upper = asset.upper()
+        base_name = self.normalize_asset_name(upper)
+        variants = []
+        
+        # 1. Siempre intentar el nombre original primero
+        if upper in ACTIVES:
+            variants.append(upper)
+        
+        # 2. Intentar nombre base sin sufijos
+        if base_name != upper and base_name in ACTIVES:
+            variants.append(base_name)
+        
+        # 3. Intentar con sufijo -OTC (común en fin de semana)
+        otc_variant = f"{base_name}-OTC"
+        if otc_variant not in variants and otc_variant in ACTIVES:
+            variants.append(otc_variant)
+        
+        # 4. Intentar con sufijo -OP (digitales)
+        op_variant = f"{base_name}-OP"
+        if op_variant not in variants and op_variant in ACTIVES:
+            variants.append(op_variant)
+        
+        return variants
 
     # ________________________________________________________________________
     # _______________________        CANDLE      _____________________________
@@ -514,43 +613,103 @@ class IQ_Option:
 
     def get_candles(self, asset, interval, count, endtime):
         """
-        Devuelve lista de velas con reintentos y reconexión.
-        Compatible con activos Digital (-op) y OTC.
+        Obtiene velas con fallback inteligente y sin crashear el bot.
+        
+        Mejoras:
+        1. Intenta múltiples variantes del nombre automáticamente
+        2. Caché de nombres válidos para acelerar consultas futuras
+        3. Retorna lista vacía en lugar de error si falla todo
+        4. Reset automático de caché de fallos cada 5 minutos
+        5. Timeout reducido a 5s por intento para evitar bloqueos
+        
+        Args:
+            asset: Nombre del activo (ej: "EURUSD", "XAUUSD-OTC")
+            interval: Timeframe en segundos (60, 300, 900, etc)
+            count: Cantidad de velas
+            endtime: Timestamp de fin
+            
+        Returns:
+            Lista de velas o lista vacía si falla
         """
         from iqoptionapi.constants import ACTIVES
-
-        name_for_candles = self.normalize_asset_name(asset)
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
+        
+        # Reset de caché de fallos cada 5 minutos
+        if time.time() - self.last_cache_reset > 300:
+            self.failed_assets.clear()
+            self.last_cache_reset = time.time()
+        
+        # Si este activo ya falló recientemente, no reintentar
+        if asset in self.failed_assets:
+            return []
+        
+        # Verificar caché primero
+        if asset in self.asset_cache:
+            cached_name = self.asset_cache[asset]
             try:
-                self.api.candles.candles_data = None
-                self.api.getcandles(
-                    ACTIVES[name_for_candles], interval, count, endtime
+                return self._fetch_candles_internal(
+                    ACTIVES[cached_name], interval, count, endtime, timeout=5
                 )
-                start = time.time()
-                while self.api.candles.candles_data is None:
-                    if time.time() - start > 10:
-                        raise TimeoutError(f"Timeout {name_for_candles}")
-                    time.sleep(0.1)
-
-                return self.api.candles.candles_data
-
             except Exception as e:
-                logging.error(
-                    f"**error** get_candles {asset} intento {attempt}/"
-                    f"{max_retries}: {e}"
+                # Si falla el caché, limpiar y reintentar con variantes
+                del self.asset_cache[asset]
+                logging.warning(f"Caché inválido para {asset}, reintentando variantes...")
+        
+        # Obtener variantes posibles
+        variants = self.get_asset_variants(asset)
+        
+        if not variants:
+            logging.error(f"❌ {asset} no existe en ACTIVES y no se encontraron variantes")
+            self.failed_assets.add(asset)
+            return []
+        
+        # Intentar cada variante
+        for variant in variants:
+            try:
+                active_id = ACTIVES[variant]
+                candles = self._fetch_candles_internal(
+                    active_id, interval, count, endtime, timeout=5
                 )
-                # reconexión suave
-                try:
-                    self.connect()
-                except Exception as re:
-                    logging.error(f"reconnect fail: {re}")
-                time.sleep(2)
-
-        raise ConnectionError(
-            f"No se pudo obtener velas para {asset} tras {max_retries} intentos"
-        )
-
+                
+                if candles:
+                    # ¡Éxito! Guardar en caché
+                    self.asset_cache[asset] = variant
+                    if variant != asset.upper():
+                        logging.info(f"✅ {asset} → usando {variant}")
+                    return candles
+                    
+            except Exception as e:
+                # Continuar con siguiente variante
+                continue
+        
+        # Si llegamos aquí, ninguna variante funcionó
+        logging.error(f"❌ No se pudieron obtener velas para {asset} (intentado: {variants})")
+        self.failed_assets.add(asset)
+        return []
+    
+    def _fetch_candles_internal(self, active_id, interval, count, endtime, timeout=5):
+        """
+        Método interno para obtener velas con timeout.
+        
+        Args:
+            active_id: ID numérico del activo
+            interval: Timeframe
+            count: Cantidad de velas
+            endtime: Timestamp de fin
+            timeout: Segundos máximos de espera
+            
+        Returns:
+            Lista de velas o None si falla
+        """
+        self.api.candles.candles_data = None
+        self.api.getcandles(active_id, interval, count, endtime)
+        
+        start = time.time()
+        while self.api.candles.candles_data is None:
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Timeout obteniendo velas (ID: {active_id})")
+            time.sleep(0.1)
+        
+        return self.api.candles.candles_data
 
 
     #######################################################
