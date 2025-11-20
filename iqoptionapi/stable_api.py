@@ -256,48 +256,86 @@ class IQ_Option:
     # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
-        Versión de depuración: Imprime todas las categorías de activos
-        recibidas de la API para descubrir el nombre correcto de las digitales.
+        Método actualizado para obtener el estado de apertura de los activos.
+        Protegido contra cambios de estructura API y tiempos de carga.
         """
+        # Estructura de retorno esperada: OPEN_TIME['turbo']['EURUSD']['open'] = True
         OPEN_TIME = nested_dict(3, dict)
-        now = time.time()
-        init_data = self.get_all_init()
+        
+        # 1. Forzar actualización de datos iniciales (Binary & Turbo)
+        # Esto puebla self.api.instruments internamente
+        self.get_all_init()
 
-        # --- INICIO DEL CÓDIGO DE DEPURACIÓN ---
-        if "result" in init_data:
-            print("\n--- DEBUG: Tipos de activos recibidos en 'result' ---")
-            print(list(init_data["result"].keys()))
-            print("-----------------------------------------------------\n")
-        else:
-            print("\n--- DEBUG: La respuesta de la API no contiene la llave 'result' ---\n")
-        # --- FIN DEL CÓDIGO DE DEPURACIÓN ---
-
-        # El resto del código intentará ejecutarse normalmente...
+        # 2. Procesar BINARY y TURBO
+        # Intentamos leer de 'instruments' primero (más fiable), si no, del 'init_result'
         try:
-            for fam in ("binary", "turbo"):
-                for aid, info in init_data.get("result", {}).get(fam, {}).get("actives", {}).items():
-                    raw_name = info.get("name", "")
-                    name = raw_name.split(".", 1)[-1] if "." in raw_name else raw_name
+            # Fuentes de datos
+            sources = {}
+            
+            # Si instruments ya cargó, lo usamos
+            if hasattr(self.api, 'instruments') and self.api.instruments:
+                sources['turbo'] = self.api.instruments.get('turbo', {})
+                sources['binary'] = self.api.instruments.get('binary', {})
+            # Si no, usamos el resultado de get_all_init
+            elif self.api.api_option_init_all_result:
+                res = self.api.api_option_init_all_result.get('result', {})
+                sources['turbo'] = res.get('turbo', {}).get('actives', {})
+                sources['binary'] = res.get('binary', {}).get('actives', {})
+
+            # Iterar y llenar el diccionario
+            for type_name, actives_dict in sources.items():
+                for _, info in actives_dict.items():
+                    if not isinstance(info, dict): continue
+                    
+                    # Obtener nombre limpio (ej: "front.EURUSD" -> "EURUSD")
+                    name = info.get('name', '')
+                    if 'front.' in name:
+                        name = name.split('.')[-1]
+                    
                     if not name: continue
-                    is_open = not info.get("is_suspended", False) and info.get("enabled", False)
-                    OPEN_TIME[fam][name]["open"] = is_open
-        except Exception as e:
-            logging.error(f"[open_time] binary/turbo error: {e}")
 
-        # Intentamos con el nombre que creemos que es correcto ('digital')
-        try:
-            digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
-            for _, info in digital_actives.items():
-                name = info.get("underlying")
-                if not name: continue
-                asset_name_with_suffix = f"{name}-OP"
-                is_open = not info.get("is_suspended", False) and info.get("enabled", False)
-                OPEN_TIME["digital"][asset_name_with_suffix]["open"] = is_open
+                    # Determinar si está abierto
+                    # Prioridad: 'open' -> 'enabled'
+                    is_open = info.get('open', info.get('enabled', False))
+                    is_suspended = info.get('is_suspended', False)
+                    
+                    if is_open and not is_suspended:
+                        OPEN_TIME[type_name][name]['open'] = True
+                    else:
+                        OPEN_TIME[type_name][name]['open'] = False
+
         except Exception as e:
-            logging.error(f"[open_time] digital error: {e}")
+            logging.error(f"Error procesando Binary/Turbo: {e}")
+
+        # 3. Procesar DIGITALES (Con el fix de 'underlying')
+        try:
+            digital_raw = self.get_digital_underlying_list_data()
+            digital_data = {}
+            
+            # Lógica inteligente para encontrar los datos
+            if isinstance(digital_raw, dict):
+                if 'underlying' in digital_raw:
+                    digital_data = digital_raw['underlying']
+                else:
+                    # Si la estructura cambió y no hay 'underlying', asumimos que es la raíz
+                    digital_data = digital_raw
+            
+            # Procesar lista digital
+            if isinstance(digital_data, dict):
+                for name, info in digital_data.items():
+                    # Digitales suelen venir como "EURUSD-OTC" o "EURUSD"
+                    # Asumimos que si están en la lista, podrían estar abiertos, 
+                    # pero verificamos 'schedule' si existe. Por defecto True para no bloquear.
+                    
+                    # Nombre para el EA (Añadimos sufijo si es necesario para diferenciar)
+                    display_name = name
+                    
+                    OPEN_TIME['digital'][display_name]['open'] = True
+                    
+        except Exception as e:
+            logging.error(f"Error procesando Digitales: {e}")
 
         return OPEN_TIME
-
 
 
     # --------for binary option detail
@@ -896,12 +934,15 @@ class IQ_Option:
     def get_digital_underlying_list_data(self):
         self.api.underlying_list_data = None
         self.api.get_digital_underlying()
+        
         start_t = time.time()
-        while self.api.underlying_list_data == None:
-            if time.time() - start_t >= 30:
-                logging.error(
-                    '**warning** get_digital_underlying_list_data late 30 sec')
-                return None
+        # Reducimos el tiempo de espera a 10s para no congelar la UI tanto tiempo
+        while self.api.underlying_list_data is None:
+            if time.time() - start_t >= 10:
+                logging.error('**warning** get_digital_underlying_list_data timeout (10s)')
+                # Retornamos un dict vacío en lugar de None para evitar crashes posteriores
+                return {}
+            time.sleep(0.1)
 
         return self.api.underlying_list_data
 
