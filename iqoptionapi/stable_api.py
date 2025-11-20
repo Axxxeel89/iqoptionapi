@@ -1182,55 +1182,106 @@ class IQ_Option:
     # thank thiagottjv
     # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/65#issuecomment-513998357
 
-    def buy_digital_spot(self, active, amount, action, duration):
+    def buy_digital_spot (self, active, amount, action, duration):
         """
-        Versión final para comprar opciones digitales.
-        Busca el ID del instrumento en los datos de inicialización.
+        Versión segura de buy_digital_spot que autocorrige nombres de activos.
+        
+        Mejoras:
+        1. Valida y corrige el nombre del activo automáticamente
+        2. Maneja minúsculas/mayúsculas
+        3. Intenta variantes si el nombre exacto no existe
+        4. Retorna errores descriptivos
+        
+        Args:
+            active: Nombre del activo (ej: "EURUSD", "EURUSD-op", "eurusd")
+            amount: Monto a invertir
+            action: "call" o "put"
+            duration: Duración en minutos
+            
+        Returns:
+            tuple: (success: bool, result: int/str)
+                - Si éxito: (True, order_id)
+                - Si fallo: (False, error_message)
         """
+        from iqoptionapi.constants import ACTIVES
+        import time
+        
+        # 1. AUTOCORRECCIÓN DEL NOMBRE DEL ACTIVO
+        corrected_active = None
+        
+        # Intentar nombre original en mayúsculas
+        upper_active = active.upper()
+        if upper_active in ACTIVES:
+            corrected_active = upper_active
+        else:
+            # Buscar variantes
+            variants = self.get_asset_variants(active)
+            if variants:
+                corrected_active = variants[0]
+                logging.info(f"🔄 Autocorregido: {active} → {corrected_active}")
+            else:
+                error_msg = f"Asset '{active}' no encontrado en ACTIVES (ni variantes)"
+                logging.error(f"❌ {error_msg}")
+                return False, error_msg
+        
+        # 2. OBTENER DATOS DE INICIALIZACIÓN
         try:
             init_data = self.get_all_init()
             digital_actives = init_data.get("result", {}).get("digital", {}).get("actives", {})
             
             if not digital_actives:
-                return False, "Mercado de digitales no disponible en este momento."
-
-            instrument_id = None
-            for _, info in digital_actives.items():
-                if info.get("underlying") == active.upper():
-                    options = info.get("option", {}).get("list", [])
-                    for opt in options:
-                        if opt.get("expiration_len") == duration * 60:
-                            instrument_id = opt.get("id")
-                            break
-                if instrument_id:
-                    break
-
-            if not instrument_id:
-                return False, f"Opción para {duration} min no disponible en {active}."
+                return False, "Mercado de digitales no disponible"
             
+        except Exception as e:
+            logging.error(f"❌ Error obteniendo init_data: {e}")
+            return False, f"Error de inicialización: {str(e)}"
+        
+        # 3. BUSCAR INSTRUMENTO DIGITAL
+        instrument_id = None
+        
+        for _, info in digital_actives.items():
+            # Comparar con nombre corregido
+            if info.get("underlying") == corrected_active:
+                options = info.get("option", {}).get("list", [])
+                for opt in options:
+                    if opt.get("expiration_len") == duration * 60:
+                        instrument_id = opt.get("id")
+                        break
+            if instrument_id:
+                break
+        
+        if not instrument_id:
+            return False, f"Opción de {duration}min no disponible para {corrected_active}"
+        
+        # 4. EJECUTAR ORDEN
+        try:
             self.api.digital_option_placed_id = None
             self.api.place_digital_option(instrument_id, amount)
-
+            
             start_time = time.time()
-            timeout_seconds = 10
+            timeout = 10
+            
             while self.api.digital_option_placed_id is None:
-                if time.time() - start_time > timeout_seconds:
-                    return False, "Timeout: El servidor no respondió a la orden."
+                if time.time() - start_time > timeout:
+                    return False, "Timeout: El servidor no respondió"
                 time.sleep(0.1)
-
+            
+            # 5. VALIDAR RESULTADO
             if isinstance(self.api.digital_option_placed_id, int):
-                # Para que check_win_v3 funcione, algunas versiones necesitan el ID de la posición
-                # que se recibe de forma asíncrona. Esta es una forma de obtenerlo.
-                time.sleep(1.5) # Esperar un poco a que llegue el mensaje de la posición
+                # Esperar confirmación de posición
+                time.sleep(1.5)
                 order_data = self.get_async_order(self.api.digital_option_placed_id)
+                
                 if "position-changed" in order_data and "id" in order_data["position-changed"]["msg"]:
                     return True, order_data["position-changed"]["msg"]["id"]
+                
                 return True, self.api.digital_option_placed_id
             else:
                 return False, self.api.digital_option_placed_id
+                
         except Exception as e:
-            logging.error(f"Excepción en buy_digital_spot: {e}")
-            return False, f"Error inesperado en la compra: {e}"
+            logging.error(f"❌ Excepción ejecutando orden: {e}")
+            return False, f"Error inesperado: {str(e)}"
 
 
 
