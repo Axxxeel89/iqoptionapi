@@ -997,8 +997,17 @@ class IQ_Option:
         if len(price) == len(ACTIVES) == len(ACTION) == len(expirations):
             buy_len = len(price)
             for idx in range(buy_len):
-                self.api.buyv3(
-                    price[idx], OP_code.ACTIVES[ACTIVES[idx]], ACTION[idx], expirations[idx], idx)
+                # --- CORRECCIÓN: Normalizar nombre ---
+                active_name = self.normalize_asset_name(ACTIVES[idx])
+                
+                try:
+                    active_id = OP_code.ACTIVES[active_name]
+                    self.api.buyv3(
+                        price[idx], active_id, ACTION[idx], expirations[idx], idx)
+                except KeyError:
+                    logging.error(f"buy_multi: ID no encontrado para {active_name}")
+                    continue
+
             while len(self.api.buy_multi_option) < buy_len:
                 pass
             buy_id = []
@@ -1053,15 +1062,34 @@ class IQ_Option:
         return self.api.result, self.api.buy_multi_option[req_id]["id"]
 
     def buy(self, price, ACTIVES, ACTION, expirations):
+        """
+        Método de compra corregido.
+        Normaliza el nombre (quita -op/-OTC) antes de buscar el ID.
+        """
         self.api.buy_multi_option = {}
         self.api.buy_successful = None
         req_id = "buy"
+        
+        # --- CORRECCIÓN: Normalizar nombre ---
+        # Convierte 'EURUSD-op' o 'EURUSD-OTC' a 'EURUSD' para encontrar su ID
+        active_name = self.normalize_asset_name(ACTIVES)
+        
         try:
             self.api.buy_multi_option[req_id]["id"] = None
         except:
             pass
+            
+        # Usamos active_name en lugar de ACTIVES para el diccionario
+        try:
+            active_id = OP_code.ACTIVES[active_name]
+        except KeyError:
+            # Fallback de seguridad: si falla la normalización, intentamos tal cual
+            logging.error(f"Activo no encontrado en constantes: {active_name}")
+            return False, "Asset ID not found"
+
         self.api.buyv3(
-            price, OP_code.ACTIVES[ACTIVES], ACTION, expirations, req_id)
+            price, active_id, ACTION, expirations, req_id)
+            
         start_t = time.time()
         id = None
         self.api.result = None
@@ -1080,6 +1108,7 @@ class IQ_Option:
                 return False, None
 
         return self.api.result, self.api.buy_multi_option[req_id]["id"]
+
 
     def sell_option(self, options_ids):
         self.api.sell_option(options_ids)
