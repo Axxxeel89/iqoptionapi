@@ -264,13 +264,8 @@ class IQ_Option:
     # ------------------------------------------------------------------
     def get_all_open_time(self):
         """
-        Versión robusta del método original con mejor manejo de errores.
-        
-        Mejoras:
-        1. Timeout de 10s en lugar de espera infinita
-        2. Estructura defensiva contra cambios de API
-        3. Logging detallado de errores
-        4. Retorna dict vacío en lugar de crash si falla
+        Obtiene disponibilidad de mercados (Binary, Turbo, Digital).
+        Versión robusta con manejo de errores y timeouts.
         """
         from collections import defaultdict
         
@@ -282,7 +277,9 @@ class IQ_Option:
         
         OPEN_TIME = nested_dict(3, dict)
         
-        # 1. Obtener datos de inicialización con timeout
+        # ═══════════════════════════════════════════════════════════
+        # PASO 1: Obtener init data (Binary/Turbo)
+        # ═══════════════════════════════════════════════════════════
         try:
             init_result = self._get_init_with_timeout(timeout=10)
             if not init_result:
@@ -292,7 +289,9 @@ class IQ_Option:
             logging.error(f"❌ Error en get_all_init: {e}")
             return OPEN_TIME
         
-        # 2. Procesar BINARY y TURBO
+        # ═══════════════════════════════════════════════════════════
+        # PASO 2: Procesar Binary/Turbo
+        # ═══════════════════════════════════════════════════════════
         try:
             result = init_result.get("result", {})
             
@@ -320,19 +319,62 @@ class IQ_Option:
         except Exception as e:
             logging.error(f"❌ Error procesando Binary/Turbo: {e}")
         
-        # 3. Procesar DIGITALES
+        # ═══════════════════════════════════════════════════════════
+        # PASO 3: Procesar Digitales (con manejo robusto)
+        # ═══════════════════════════════════════════════════════════
         try:
-            digital_data = self._get_digital_data_safe()
+            # 🔥 CRÍTICO: Llamar directamente a get_digital_underlying_list_data
+            # que ya tiene timeout incorporado
+            self.api.underlying_list_data = None
+            self.api.get_digital_underlying()
             
+            start_t = time.time()
+            while self.api.underlying_list_data is None:
+                if time.time() - start_t > 10:
+                    logging.warning("⚠️ Timeout obteniendo digitales, omitiendo...")
+                    return OPEN_TIME
+                time.sleep(0.1)
+            
+            raw_data = self.api.underlying_list_data
+            
+            # 🔥 VALIDACIÓN: Verificar estructura antes de acceder
+            if not raw_data or not isinstance(raw_data, dict):
+                logging.warning("⚠️ Datos digitales vacíos o inválidos")
+                return OPEN_TIME
+            
+            # 🔥 MANEJO DE ESTRUCTURAS VARIABLES
+            digital_data = {}
+            
+            # Intentar estructura con "underlying" (estructura esperada)
+            if "underlying" in raw_data and isinstance(raw_data["underlying"], list):
+                for item in raw_data["underlying"]:
+                    if isinstance(item, dict) and "name" in item:
+                        digital_data[item["name"]] = item
+            
+            # Fallback: estructura plana (por si cambia la API)
+            elif isinstance(raw_data, list):
+                for item in raw_data:
+                    if isinstance(item, dict) and "name" in item:
+                        digital_data[item["name"]] = item
+            
+            # Fallback 2: dict directo
+            elif all(isinstance(v, dict) for v in raw_data.values()):
+                digital_data = raw_data
+            
+            # Procesar digitales
             for name, info in digital_data.items():
-                # Para digitales, si están en la lista, asumimos que están disponibles
-                OPEN_TIME["digital"][name]["open"] = True
-                
+                if isinstance(info, dict):
+                    # Para digitales, si están en la lista están disponibles
+                    OPEN_TIME["digital"][name]["open"] = True
+                    
         except Exception as e:
             logging.error(f"❌ Error procesando Digitales: {e}")
+            import traceback
+            traceback.print_exc()
         
         return OPEN_TIME
-    
+
+
     def _get_digital_data_safe(self):
         """
         Obtiene datos digitales con manejo robusto de estructuras variables.
@@ -374,7 +416,8 @@ class IQ_Option:
             time.sleep(0.1)
         
         return self.api.api_option_init_all_result
-    
+
+
     def is_asset_available(self, asset):
         """
         Verifica rápidamente si un activo está disponible sin obtener velas.
