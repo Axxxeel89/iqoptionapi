@@ -935,16 +935,35 @@ class IQ_Option:
             time.sleep(polling_time)
 
     def check_win_v3(self, id_number):
-        while True:
+        import time
+        start_time = time.time()
+        # Timeout de 2 minutos máximo para esperar resultado
+        while time.time() - start_time < 120:
             try:
-
                 if self.get_async_order(id_number)["option-closed"] != {}:
                     break
             except:
                 pass
+            time.sleep(0.2) # Pausa para no saturar CPU
 
-        return self.get_async_order(id_number)["option-closed"]["msg"]["profit_amount"] - \
-               self.get_async_order(id_number)["option-closed"]["msg"]["amount"]
+        try:
+            # Intentar obtener resultado
+            data = self.get_async_order(id_number)
+            if data["option-closed"] != {}:
+                return data["option-closed"]["msg"]["profit_amount"] - \
+                       data["option-closed"]["msg"]["amount"]
+            else:
+                return None # Retorna None si hubo timeout
+        except:
+            return None
+        
+    def close(self):    
+        """Cierra la conexión API de forma segura"""
+        if hasattr(self, 'api') and self.api:
+            try:
+                self.api.close()
+            except:
+                pass
 
     # -------------------get infomation only for binary option------------------------
 
